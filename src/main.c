@@ -1911,6 +1911,9 @@ static int main_run_hook_frontend(cbm_daemon_runtime_client_t *client, const cha
     cbm_daemon_runtime_application_status_t status = cbm_daemon_application_client_hook_augment(
         client, input, &response, &response_length, MAIN_HOOK_REQUEST_TIMEOUT_MS);
     free(input);
+    /* The response is complete and owned locally. Cancel before stdout so a
+     * deadline can never interrupt the JSON write and expose a partial object. */
+    cbm_hook_augment_disarm_deadline();
     if (status == CBM_DAEMON_RUNTIME_APPLICATION_OK && response && response_length > 0) {
         (void)fwrite(response, 1, response_length, stdout);
         (void)fflush(stdout);
@@ -2710,11 +2713,9 @@ int main(int argc, char **argv) {
      * spawn cannot fit the fail-open budget and livelocks against the
      * last-client-exit teardown), it recycles whichever daemon an MCP
      * session or `daemon start` already brought up. Arm the deadline before
-     * hashing and IPC. */
+     * stdin, hashing, and IPC. */
     if (role == CBM_DAEMON_PROCESS_HOOK_CLIENT) {
-#ifndef _WIN32
         cbm_hook_augment_arm_deadline();
-#endif
         /* Read stdin now and bail before executable-identity hashing when the
          * event can never produce output (an un-forced PreToolUse Bash call
          * that is not a search). The identity hash costs ~1.1 s of user CPU
@@ -2725,10 +2726,12 @@ int main(int argc, char **argv) {
         if (!hook_event) {
             char *hook_input = cbm_hook_augment_read_stdin();
             if (!hook_input) {
+                cbm_hook_augment_disarm_deadline();
                 return EXIT_SUCCESS; /* fail open, nothing to augment */
             }
             if (cbm_hook_augment_input_is_noop_bash(hook_input)) {
                 free(hook_input);
+                cbm_hook_augment_disarm_deadline();
                 return EXIT_SUCCESS;
             }
             cbm_hook_augment_prefetch_stdin(hook_input);
@@ -2910,7 +2913,11 @@ int main(int argc, char **argv) {
         (void)fprintf(stderr,
                       "codebase-memory-mcp: exact executable identity could not be verified "
                       "(executable-path)\n");
-        return role == CBM_DAEMON_PROCESS_HOOK_CLIENT ? EXIT_SUCCESS : EXIT_FAILURE;
+        if (role == CBM_DAEMON_PROCESS_HOOK_CLIENT) {
+            cbm_hook_augment_disarm_deadline();
+            return EXIT_SUCCESS;
+        }
+        return EXIT_FAILURE;
     }
     main_build_identity_status_t identity_status = main_build_identity(&identity);
     if (identity_status != MAIN_BUILD_IDENTITY_OK) {
@@ -2920,7 +2927,11 @@ int main(int argc, char **argv) {
                       "(%s)%s%s\n",
                       main_build_identity_status_name(identity_status),
                       validation_detail[0] ? " - " : "", validation_detail);
-        return role == CBM_DAEMON_PROCESS_HOOK_CLIENT ? EXIT_SUCCESS : EXIT_FAILURE;
+        if (role == CBM_DAEMON_PROCESS_HOOK_CLIENT) {
+            cbm_hook_augment_disarm_deadline();
+            return EXIT_SUCCESS;
+        }
+        return EXIT_FAILURE;
     }
     cbm_http_server_set_binary_path(executable_path);
 
@@ -3076,6 +3087,9 @@ int main(int argc, char **argv) {
         (void)snprintf(message, sizeof(message), "secure daemon endpoint could not be created%s%s",
                        (why && why[0]) ? ": " : "", (why && why[0]) ? why : "");
         main_report_client_failure(role, message);
+        if (role == CBM_DAEMON_PROCESS_HOOK_CLIENT) {
+            cbm_hook_augment_disarm_deadline();
+        }
         return EXIT_FAILURE;
     }
 
@@ -3136,10 +3150,14 @@ int main(int argc, char **argv) {
                       formatted ? message : "client exact-build admission failed");
         if (role == CBM_DAEMON_PROCESS_HOOK_CLIENT &&
             client_cohort_status == CBM_VERSION_COHORT_CONFLICT) {
+            cbm_hook_augment_disarm_deadline();
             main_hook_report_conflicted_daemon(hook_dialect);
         }
         (void)main_version_cohort_close(&client_cohort_lease, &client_cohort_manager);
         cbm_daemon_ipc_endpoint_free(endpoint);
+        if (role == CBM_DAEMON_PROCESS_HOOK_CLIENT) {
+            cbm_hook_augment_disarm_deadline();
+        }
         return role == CBM_DAEMON_PROCESS_HOOK_CLIENT ? EXIT_SUCCESS : EXIT_FAILURE;
     }
 
@@ -3150,6 +3168,7 @@ int main(int argc, char **argv) {
             endpoint, &identity, MAIN_HOOK_CONNECT_TIMEOUT_MS, &hook_connect);
         cbm_daemon_ipc_endpoint_free(endpoint);
         if (!hook_client) {
+            cbm_hook_augment_disarm_deadline();
             if (hook_connect.status == CBM_DAEMON_RUNTIME_CONNECT_CONFLICT) {
                 char conflict_detail[CBM_DAEMON_CONFLICT_MESSAGE_SIZE];
                 if (cbm_daemon_conflict_format(&hook_connect.conflict, conflict_detail,
@@ -3163,17 +3182,13 @@ int main(int argc, char **argv) {
             (void)main_version_cohort_close(&client_cohort_lease, &client_cohort_manager);
             return EXIT_SUCCESS;
         }
-#ifdef _WIN32
-        /* Windows keeps the upstream fixed augmentation budget, armed only
-         * after the authenticated connection. */
-        cbm_hook_augment_arm_deadline();
-#endif
         /* Fail-open: a hook must never block the caller's tool use, so the
          * exit code is EXIT_SUCCESS even when augmentation failed — the
          * frontend already emitted any visible notice. */
         (void)main_run_hook_frontend(hook_client, hook_event, hook_dialect);
         (void)cbm_daemon_runtime_client_close(hook_client, MAIN_HOOK_CLOSE_TIMEOUT_MS);
         (void)main_version_cohort_close(&client_cohort_lease, &client_cohort_manager);
+        cbm_hook_augment_disarm_deadline();
         return EXIT_SUCCESS;
     }
 

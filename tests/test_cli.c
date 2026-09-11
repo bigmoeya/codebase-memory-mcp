@@ -636,8 +636,7 @@ static void restore_test_env(const char *name, char *saved) {
  * ha_deadline_ms records a hunt for hook runs that never finished (0 of 24 real
  * sessions), which is exactly the symptom a silently-shortened deadline makes.
  *
- * POSIX only: the Windows path arms a fixed timer and reads no environment. */
-#ifndef _WIN32
+ * The resolver is shared by POSIX and Windows. */
 TEST(cli_hook_deadline_ignores_an_unreadable_value) {
     enum { HOOK_DEADLINE_DEFAULT = 2000, HOOK_DEADLINE_MIN = 50, HOOK_DEADLINE_MAX = 10000 };
     char *saved = save_test_env("CBM_HOOK_DEADLINE_MS");
@@ -667,6 +666,35 @@ TEST(cli_hook_deadline_ignores_an_unreadable_value) {
     ASSERT_EQ(cbm_hook_augment_deadline_ms_for_testing(), HOOK_DEADLINE_MIN);
     cbm_setenv("CBM_HOOK_DEADLINE_MS", "999999", 1);
     ASSERT_EQ(cbm_hook_augment_deadline_ms_for_testing(), HOOK_DEADLINE_MAX);
+
+    restore_test_env("CBM_HOOK_DEADLINE_MS", saved);
+    PASS();
+}
+
+#ifdef _WIN32
+TEST(cli_hook_deadline_windows_timer_lifecycle) {
+    char *saved = save_test_env("CBM_HOOK_DEADLINE_MS");
+    set_test_env("CBM_HOOK_DEADLINE_MS", "10000");
+
+    cbm_hook_augment_disarm_deadline();
+    ASSERT_FALSE(cbm_hook_augment_deadline_active_for_testing());
+
+    cbm_hook_augment_arm_deadline();
+    ASSERT_TRUE(cbm_hook_augment_deadline_active_for_testing());
+    cbm_hook_augment_disarm_deadline();
+    ASSERT_FALSE(cbm_hook_augment_deadline_active_for_testing());
+
+    cbm_hook_augment_fail_timer_create_once_for_testing();
+    cbm_hook_augment_arm_deadline();
+    ASSERT_FALSE(cbm_hook_augment_deadline_active_for_testing());
+
+    cbm_hook_augment_arm_deadline();
+    ASSERT_TRUE(cbm_hook_augment_deadline_active_for_testing());
+    cbm_hook_augment_fail_timer_delete_once_for_testing();
+    cbm_hook_augment_disarm_deadline();
+    ASSERT_TRUE(cbm_hook_augment_deadline_active_for_testing());
+    cbm_hook_augment_disarm_deadline();
+    ASSERT_FALSE(cbm_hook_augment_deadline_active_for_testing());
 
     restore_test_env("CBM_HOOK_DEADLINE_MS", saved);
     PASS();
@@ -14898,8 +14926,9 @@ SUITE(cli) {
 
     RUN_TEST(cli_suite_uses_private_activation_runtime);
     RUN_TEST(cli_update_only_names_an_installer_that_exists_issue1632);
-#ifndef _WIN32
     RUN_TEST(cli_hook_deadline_ignores_an_unreadable_value);
+#ifdef _WIN32
+    RUN_TEST(cli_hook_deadline_windows_timer_lifecycle);
 #endif
     RUN_TEST(cli_index_restart_cap_honours_zero_and_refuses_junk);
     RUN_TEST(cli_progress_visibility_policy);

@@ -21,6 +21,7 @@
 #include "foundation/constants.h"
 #include "foundation/mem.h"
 #include "foundation/platform.h"
+#include "foundation/win_utf8.h"
 #include "mcp/mcp.h"
 #include "pipeline/pipeline.h"
 #include "yyjson/yyjson.h"
@@ -49,8 +50,9 @@
 #define HA_LIST_PAGE_LIMIT 500
 #define HA_METADATA_CAP 192
 #define HA_MAX_WALKUP 8    /* cwd may be a subdir of the indexed root  */
-#define HA_DEADLINE_MS 300 /* hard in-process budget (see also: the    */
-                           /* settings.json "timeout" backstop)        */
+#define HA_DEADLINE_DEFAULT_MS 2000 /* in-process budget; see ha_deadline_ms() */
+#define HA_DEADLINE_MIN_MS 50
+#define HA_DEADLINE_MAX_MS 10000
 
 /* ── Hard deadline ────────────────────────────────────────────────
  * A slow SQLite open or query must never stall the agent. When the timer
@@ -61,11 +63,6 @@
  * "no matches", so the handler first write()s a pre-formatted breadcrumb to
  * ~/.cache/codebase-memory-mcp/logs/hook-augment-timeouts.log (fd and message
  * prepared at arm time — only async-signal-safe write/_exit in the handler). */
-#ifndef _WIN32
-#define HA_DEADLINE_DEFAULT_MS 2000 /* in-process budget; see ha_deadline_ms()  */
-#define HA_DEADLINE_MIN_MS 50
-#define HA_DEADLINE_MAX_MS 10000
-
 /* #858: the original 300ms budget silently self-terminated on real cold
  * starts (SQLite/mmap open under load), so augmentation never appeared in
  * real sessions (0/24 observed) while manual warm invocations worked. The
@@ -89,6 +86,12 @@ static int ha_deadline_ms(void) {
     }
     return (int)v;
 }
+
+int cbm_hook_augment_deadline_ms_for_testing(void) {
+    return ha_deadline_ms();
+}
+
+#ifndef _WIN32
 
 static int g_ha_crumb_fd = -1;
 static char g_ha_crumb_msg[160];
@@ -129,10 +132,6 @@ static void ha_open_crumb_log(int deadline_ms) {
     g_ha_crumb_len = (n > 0 && n < (int)sizeof(g_ha_crumb_msg)) ? (size_t)n : 0;
 }
 
-int cbm_hook_augment_deadline_ms_for_testing(void) {
-    return ha_deadline_ms();
-}
-
 void cbm_hook_augment_arm_deadline(void) {
     int ms = ha_deadline_ms();
     ha_open_crumb_log(ms);
@@ -149,16 +148,133 @@ void cbm_hook_augment_arm_deadline(void) {
     setitimer(ITIMER_REAL, &it, NULL);
 }
 #else
+static HANDLE g_ha_timer = NULL;
+static HANDLE g_ha_crumb_handle = INVALID_HANDLE_VALUE;
+static char g_ha_crumb_msg[160];
+static DWORD g_ha_crumb_len = 0;
+#ifdef CBM_CLI_ENABLE_TEST_API
+static bool g_ha_test_fail_timer_create_once = false;
+static bool g_ha_test_fail_timer_delete_once = false;
+#endif
+
+static void ha_close_crumb_log_windows(void) {
+    HANDLE breadcrumb = g_ha_crumb_handle;
+    g_ha_crumb_handle = INVALID_HANDLE_VALUE;
+    g_ha_crumb_len = 0;
+    if (breadcrumb != INVALID_HANDLE_VALUE) {
+        (void)CloseHandle(breadcrumb);
+    }
+}
+
+static void ha_open_crumb_log_windows(int deadline_ms) {
+    char path[CBM_SZ_1K];
+    const char *override = getenv("CBM_HOOK_TIMEOUT_LOG");
+    if (override && override[0]) {
+        snprintf(path, sizeof(path), "%s", override);
+    } else {
+        const char *cache = cbm_resolve_cache_dir();
+        if (!cache || !cache[0]) {
+            return;
+        }
+        char logs[CBM_SZ_1K];
+        snprintf(logs, sizeof(logs), "%s/logs", cache);
+        if (cbm_mkdir_p_ex(logs, 0755, CBM_MKDIR_FOLLOW_OWNED) != 0) {
+            return;
+        }
+        snprintf(path, sizeof(path), "%s/hook-augment-timeouts.log", logs);
+    }
+    wchar_t *wide_path = cbm_path_to_wide(path);
+    if (!wide_path) {
+        return;
+    }
+    g_ha_crumb_handle = CreateFileW(wide_path, FILE_APPEND_DATA,
+                                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                                    OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    free(wide_path);
+    if (g_ha_crumb_handle == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    int written = snprintf(g_ha_crumb_msg, sizeof(g_ha_crumb_msg),
+                           "hook-augment: deadline_exceeded ms=%d pid=%lu (raise via "
+                           "CBM_HOOK_DEADLINE_MS)\n",
+                           deadline_ms, (unsigned long)GetCurrentProcessId());
+    g_ha_crumb_len = written > 0 && written < (int)sizeof(g_ha_crumb_msg) ? (DWORD)written : 0;
+}
+
 static VOID CALLBACK ha_deadline_exit_windows(PVOID context, BOOLEAN fired) {
     (void)context;
     (void)fired;
+    if (g_ha_crumb_handle != INVALID_HANDLE_VALUE && g_ha_crumb_len > 0) {
+        DWORD ignored = 0;
+        (void)WriteFile(g_ha_crumb_handle, g_ha_crumb_msg, g_ha_crumb_len, &ignored, NULL);
+    }
     ExitProcess(0U);
 }
 
 void cbm_hook_augment_arm_deadline(void) {
-    HANDLE timer = NULL;
-    (void)CreateTimerQueueTimer(&timer, NULL, ha_deadline_exit_windows, NULL, HA_DEADLINE_MS, 0U,
-                                WT_EXECUTEONLYONCE);
+    int deadline_ms = ha_deadline_ms();
+    ha_open_crumb_log_windows(deadline_ms);
+#ifdef CBM_CLI_ENABLE_TEST_API
+    if (g_ha_test_fail_timer_create_once) {
+        g_ha_test_fail_timer_create_once = false;
+        ha_close_crumb_log_windows();
+        return;
+    }
+#endif
+    if (!CreateTimerQueueTimer(&g_ha_timer, NULL, ha_deadline_exit_windows, NULL,
+                               (DWORD)deadline_ms, 0U, WT_EXECUTEONLYONCE)) {
+        g_ha_timer = NULL;
+        ha_close_crumb_log_windows();
+    }
+}
+
+void cbm_hook_augment_disarm_deadline(void) {
+    HANDLE timer = g_ha_timer;
+    if (timer) {
+        /* Wait for cancellation to finish before closing the breadcrumb. If
+         * the callback already won the race it exits the process fail-open;
+         * otherwise no callback can retain either handle after this returns. */
+#ifdef CBM_CLI_ENABLE_TEST_API
+        if (g_ha_test_fail_timer_delete_once) {
+            g_ha_test_fail_timer_delete_once = false;
+            return;
+        }
+#endif
+        if (!DeleteTimerQueueTimer(NULL, timer, INVALID_HANDLE_VALUE)) {
+            /* The callback may already own the breadcrumb handle. Do not close
+             * it from this thread; process teardown remains the safe cleanup. */
+            return;
+        }
+        g_ha_timer = NULL;
+    }
+    ha_close_crumb_log_windows();
+}
+
+#ifdef CBM_CLI_ENABLE_TEST_API
+void cbm_hook_augment_fail_timer_create_once_for_testing(void) {
+    g_ha_test_fail_timer_create_once = true;
+}
+
+void cbm_hook_augment_fail_timer_delete_once_for_testing(void) {
+    g_ha_test_fail_timer_delete_once = true;
+}
+
+bool cbm_hook_augment_deadline_active_for_testing(void) {
+    return g_ha_timer != NULL;
+}
+#endif
+#endif
+
+#ifndef _WIN32
+void cbm_hook_augment_disarm_deadline(void) {
+    struct itimerval disabled;
+    memset(&disabled, 0, sizeof(disabled));
+    (void)setitimer(ITIMER_REAL, &disabled, NULL);
+    if (g_ha_crumb_fd >= 0) {
+        (void)close(g_ha_crumb_fd);
+        g_ha_crumb_fd = -1;
+    }
+    g_ha_crumb_len = 0;
 }
 #endif
 
@@ -1780,25 +1896,32 @@ int cbm_cmd_hook_augment(int argc, char **argv) {
                    ha_dialect_from_name(argv[i + 1], &dialect)) {
             i++;
         } else {
+            cbm_hook_augment_disarm_deadline();
             return 0;
         }
     }
     /* Copilot omits the event in stdin and therefore requires --event. Other
      * forced events must be documented lifecycle events for their dialect. */
     if (!ha_invocation_supported(dialect, forced_event)) {
+        cbm_hook_augment_disarm_deadline();
         return 0;
     }
 
     char *input = cbm_hook_augment_read_stdin();
     if (!input) {
+        cbm_hook_augment_disarm_deadline();
         return 0;
     }
     if (!forced_event && cbm_hook_augment_input_is_noop_bash(input)) {
         free(input);
+        cbm_hook_augment_disarm_deadline();
         return 0;
     }
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     char *output = srv ? ha_process(srv, input, forced_event, dialect) : NULL;
+    /* Once a complete response exists, cancel the hard deadline before the
+     * first stdout byte so timeout can never leave malformed partial JSON. */
+    cbm_hook_augment_disarm_deadline();
     if (output) {
         fputs(output, stdout);
     }

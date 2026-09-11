@@ -526,12 +526,15 @@ char *cbm_hook_augment_lifecycle_json_for(const char *input, const char *forced_
 /* Thin daemon frontend support: preserve the hook's bounded stdin read and
  * hard fail-open deadline without constructing a local MCP/store instance. */
 void cbm_hook_augment_arm_deadline(void);
+void cbm_hook_augment_disarm_deadline(void);
 
 /* The in-process deadline in milliseconds, as CBM_HOOK_DEADLINE_MS resolves it.
- * Exposed so a test can check what an unreadable value falls back to. POSIX
- * only: the Windows path arms a fixed timer and reads no environment value. */
-#ifndef _WIN32
+ * Exposed so tests on every platform can check the shared policy. */
 int cbm_hook_augment_deadline_ms_for_testing(void);
+#if defined(_WIN32) && defined(CBM_CLI_ENABLE_TEST_API)
+void cbm_hook_augment_fail_timer_create_once_for_testing(void);
+void cbm_hook_augment_fail_timer_delete_once_for_testing(void);
+bool cbm_hook_augment_deadline_active_for_testing(void);
 #endif
 char *cbm_hook_augment_read_stdin(void);
 /* Pure no-op gate for the hook-client fast path (see hook_augment.c). */

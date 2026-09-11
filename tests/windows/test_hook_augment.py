@@ -47,6 +47,46 @@ def run_cli(binary, cache, args, stdin=None, timeout=120):
                           env=env, input=stdin)
 
 
+def assert_timeout_is_fail_open_and_atomic(binary, cache, work):
+    """A blocked stdin read must time out without emitting partial JSON."""
+    breadcrumb = os.path.join(work, "hook-timeouts.log")
+    env = dict(os.environ)
+    env["CBM_CACHE_DIR"] = cache
+    env["CBM_RUNTIME_DIR"] = os.path.join(cache, "runtime")
+    env["CBM_HOOK_DEADLINE_MS"] = "50"
+    env["CBM_HOOK_TIMEOUT_LOG"] = breadcrumb
+    proc = subprocess.Popen([binary, "hook-augment"], stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+    try:
+        proc.wait(timeout=10)
+        stdout = proc.stdout.read()
+        stderr = proc.stderr.read()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)
+        if proc.stdin:
+            proc.stdin.close()
+
+    if proc.returncode != 0:
+        raise AssertionError("deadline was not fail-open: rc=%d stderr=%r" %
+                             (proc.returncode, (stderr or b"")[:500]))
+    if stdout:
+        try:
+            json.loads(stdout.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise AssertionError("deadline emitted malformed/partial JSON: %r" % stdout) from exc
+        raise AssertionError("blocked hook unexpectedly emitted JSON: %r" % stdout)
+    try:
+        with open(breadcrumb, "r", encoding="utf-8") as f:
+            crumb = f.read()
+    except OSError as exc:
+        raise AssertionError("deadline breadcrumb was not written") from exc
+    if "deadline_exceeded ms=50" not in crumb:
+        raise AssertionError("deadline breadcrumb missing details: %r" % crumb)
+    print("deadline: fail-open exit, breadcrumb, and atomic stdout verified")
+
+
 def main():
     if len(sys.argv) < 2:
         print("usage: python test_hook_augment.py <binary>")
@@ -73,6 +113,8 @@ def main():
         cache = os.path.join(work, "cache")
         os.makedirs(cache, exist_ok=True)
         os.makedirs(os.path.join(cache, "runtime"), mode=0o700, exist_ok=True)
+
+        assert_timeout_is_fail_open_and_atomic(binary, cache, work)
 
         # The CLI and hooks share the mandatory daemon. Start the supported
         # permanent mode before indexing so every product-surface command uses
